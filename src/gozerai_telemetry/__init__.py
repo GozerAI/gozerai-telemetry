@@ -1,6 +1,6 @@
 """GozerAI Telemetry — lightweight observability for standalone products.
 
-Zero dependencies. Standard observability module for the GozerAI ecosystem.
+Zero dependencies. Lightweight observability.
 Import and use in any GozerAI product to emit metrics, traces, and health status.
 
 Usage:
@@ -33,6 +33,18 @@ from gozerai_telemetry.metrics import (
 )
 from gozerai_telemetry.tracing import Span, Tracer, span
 from gozerai_telemetry.health import HealthCheck, HealthReporter, HealthStatus
+from gozerai_telemetry.resilience import (
+    RetryPolicy,
+    CircuitBreaker,
+    CircuitState,
+    resilient_fetch,
+    resilient_request,
+    get_circuit_breaker,
+    reset_all_breakers,
+    DEFAULT_RETRY,
+    CONSERVATIVE_RETRY,
+    AGGRESSIVE_RETRY,
+)
 
 __all__ = [
     "Counter",
@@ -46,4 +58,14 @@ __all__ = [
     "HealthCheck",
     "HealthReporter",
     "HealthStatus",
+    "RetryPolicy",
+    "CircuitBreaker",
+    "CircuitState",
+    "resilient_fetch",
+    "resilient_request",
+    "get_circuit_breaker",
+    "reset_all_breakers",
+    "DEFAULT_RETRY",
+    "CONSERVATIVE_RETRY",
+    "AGGRESSIVE_RETRY",
 ]

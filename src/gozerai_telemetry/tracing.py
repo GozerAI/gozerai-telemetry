@@ -1,4 +1,4 @@
-"""Distributed tracing with standard observability format.
+"""Distributed tracing with context propagation.
 
 Provides lightweight span tracking with context propagation.
 Zero dependencies — uses contextvars for async-safe context.
