@@ -1,6 +1,6 @@
 """GozerAI Telemetry — lightweight observability for standalone products.
 
-Zero dependencies. Compatible with C-Suite's observability module.
+Zero dependencies. Standard observability module for the GozerAI ecosystem.
 Import and use in any GozerAI product to emit metrics, traces, and health status.
 
 Usage:
