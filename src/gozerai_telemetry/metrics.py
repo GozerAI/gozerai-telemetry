@@ -1,6 +1,6 @@
 """Prometheus-compatible metrics collection.
 
-Prometheus-compatible metrics collection.
+Compatible with C-Suite's observability/metrics.py format.
 Zero dependencies — pure Python with thread-safe operations.
 """
 

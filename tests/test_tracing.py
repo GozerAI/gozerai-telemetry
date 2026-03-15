@@ -1,5 +1,8 @@
 """Tests for distributed tracing."""
 
+import threading
+import time
+
 from gozerai_telemetry.tracing import Span, Tracer, span
 
 
@@ -37,6 +40,40 @@ class TestSpan:
         assert d["name"] == "test"
         assert d["service"] == "svc"
         assert d["end_time"] is not None
+
+    def test_duration_no_end(self):
+        s = Span(name="test", trace_id="abc", span_id="123")
+        s.start_time = time.time() - 0.1  # 100ms ago
+        # duration_ms should use current time since end() not called
+        assert s.end_time is None
+        assert s.duration_ms >= 100.0  # at least 100ms
+
+    def test_multiple_events(self):
+        s = Span(name="test", trace_id="abc", span_id="123")
+        for i in range(5):
+            s.add_event(f"event_{i}", index=i)
+        assert len(s.events) == 5
+        # Order preserved
+        for i in range(5):
+            assert s.events[i].name == f"event_{i}"
+            assert s.events[i].attributes["index"] == i
+
+    def test_to_dict_with_events(self):
+        s = Span(name="test", trace_id="abc", span_id="123")
+        s.add_event("start", phase="init")
+        s.add_event("end", phase="done")
+        s.end()
+        d = s.to_dict()
+        assert len(d["events"]) == 2
+        assert d["events"][0]["name"] == "start"
+        assert d["events"][0]["attrs"]["phase"] == "init"
+        assert d["events"][1]["name"] == "end"
+
+    def test_set_attribute_overwrite(self):
+        s = Span(name="test", trace_id="abc", span_id="123")
+        s.set_attribute("key", "first")
+        s.set_attribute("key", "second")
+        assert s.attributes["key"] == "second"
 
 
 class TestTracer:
@@ -99,6 +136,76 @@ class TestTracer:
         with tracer.span("op", source="github", count=5) as s:
             pass
         assert tracer.get_completed()[0].attributes["source"] == "github"
+
+    def test_deeply_nested_spans(self):
+        tracer = Tracer("myservice")
+        depth = 10
+        spans = []
+
+        # Build nested spans iteratively using context managers
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for i in range(depth):
+                s = stack.enter_context(tracer.span(f"level_{i}"))
+                spans.append(s)
+
+        completed = tracer.get_completed()
+        assert len(completed) == depth
+
+        # All share the same trace_id
+        trace_ids = {s.trace_id for s in completed}
+        assert len(trace_ids) == 1
+
+        # Each span (except root) has correct parent
+        span_map = {s.name: s for s in completed}
+        for i in range(1, depth):
+            child = span_map[f"level_{i}"]
+            parent = span_map[f"level_{i - 1}"]
+            assert child.parent_span_id == parent.span_id
+
+        # Root has no parent
+        assert span_map["level_0"].parent_span_id is None
+
+    def test_span_service_name_propagated(self):
+        tracer = Tracer("my_svc")
+        with tracer.span("op1") as s1:
+            with tracer.span("op2") as s2:
+                pass
+        for s in tracer.get_completed():
+            assert s.service_name == "my_svc"
+
+    def test_concurrent_spans(self):
+        tracer = Tracer("conc_svc")
+        barrier = threading.Barrier(5)
+
+        def create_span(idx):
+            barrier.wait()
+            with tracer.span(f"thread_{idx}"):
+                pass
+
+        threads = [threading.Thread(target=create_span, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        completed = tracer.get_completed()
+        assert len(completed) == 5
+        names = {s.name for s in completed}
+        assert names == {f"thread_{i}" for i in range(5)}
+
+    def test_get_traces_multiple_traces(self):
+        tracer = Tracer("multi_trace")
+        # Create separate (non-nested) spans — each gets its own trace_id
+        with tracer.span("a"):
+            pass
+        with tracer.span("b"):
+            pass
+        with tracer.span("c"):
+            pass
+
+        traces = tracer.get_traces()
+        assert len(traces) == 3  # Each is its own trace
 
 
 class TestStandaloneSpan:

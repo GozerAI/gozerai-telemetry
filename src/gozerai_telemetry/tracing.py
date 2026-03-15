@@ -1,4 +1,4 @@
-"""Distributed tracing with context propagation.
+"""Distributed tracing compatible with C-Suite's observability/tracing.py.
 
 Provides lightweight span tracking with context propagation.
 Zero dependencies — uses contextvars for async-safe context.

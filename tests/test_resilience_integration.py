@@ -125,7 +125,7 @@ class TestResilientFetchIntegration:
         policy = RetryPolicy(max_retries=2, base_delay=0.01, jitter=False)
         from unittest.mock import patch
 
-        with patch("gozerai_telemetry.resilience.urlopen", side_effect=counting_urlopen):
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=counting_urlopen):
             result = resilient_fetch(
                 UNREACHABLE_URL, retry_policy=policy, timeout=0.5,
             )
@@ -145,7 +145,7 @@ class TestResilientFetchIntegration:
         policy = RetryPolicy(max_retries=0)
         from unittest.mock import patch
 
-        with patch("gozerai_telemetry.resilience.urlopen", side_effect=counting_urlopen):
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=counting_urlopen):
             result = resilient_fetch(UNREACHABLE_URL, retry_policy=policy)
 
         assert result is None

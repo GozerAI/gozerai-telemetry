@@ -1,6 +1,7 @@
 """Tests for resilience module — retry, circuit breaker, resilient HTTP."""
 
 import json
+import threading
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -68,6 +69,20 @@ class TestRetryPolicy:
         p = RetryPolicy(retryable_statuses={500, 502})
         assert p.is_retryable_status(500)
         assert not p.is_retryable_status(503)
+
+    def test_delay_attempt_zero_no_jitter(self):
+        p = RetryPolicy(base_delay=2.0, jitter=False)
+        assert p.delay_for_attempt(0) == 2.0
+
+    def test_negative_max_retries(self):
+        p = RetryPolicy(max_retries=-1)
+        # range(-1 + 1) = range(0) => 0 iterations => 0 attempts
+        assert p.max_retries == -1
+
+    def test_retryable_exception_subclass(self):
+        p = RetryPolicy()
+        # ConnectionResetError is a subclass of ConnectionError
+        assert p.is_retryable_exception(ConnectionResetError("reset"))
 
 
 # -- CircuitBreaker --------------------------------------------------------
@@ -161,6 +176,58 @@ class TestCircuitBreaker:
         cb.record_failure()
         assert cb._failure_count == 1
 
+    def test_concurrent_record_failure(self):
+        cb = CircuitBreaker(failure_threshold=100, name="conc-test")
+        barrier = threading.Barrier(10)
+
+        def fail():
+            barrier.wait()
+            for _ in range(10):
+                cb.record_failure()
+
+        threads = [threading.Thread(target=fail) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 10 threads * 10 failures = 100 total
+        assert cb._total_failures == 100
+        assert cb._total_requests == 100
+
+    def test_stats_after_many_operations(self):
+        cb = CircuitBreaker(failure_threshold=200, name="stats-test")
+        for _ in range(100):
+            cb.record_success()
+        for _ in range(50):
+            cb.record_failure()
+        stats = cb.get_stats()
+        assert stats["total_requests"] == 150
+        assert stats["total_failures"] == 50
+        assert stats["success_count"] == 100
+
+    def test_half_open_allows_exactly_one(self):
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.1, name="half-open-one")
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        time.sleep(0.15)
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.allow_request() is True
+        # After one failure, goes back to OPEN
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        assert cb.allow_request() is False
+
+    def test_recovery_timeout_boundary(self):
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0.2, name="boundary-test")
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        # Just before timeout
+        time.sleep(0.1)
+        assert cb.state == CircuitState.OPEN
+        # After timeout
+        time.sleep(0.15)
+        assert cb.state == CircuitState.HALF_OPEN
+
 
 # -- Circuit breaker registry ----------------------------------------------
 
@@ -214,7 +281,7 @@ class TestResilientFetch:
         reset_all_breakers()
 
     def test_success(self):
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     return_value=_mock_urlopen_response({"ok": True})):
             result = resilient_fetch("http://test/api")
             assert result == {"ok": True}
@@ -230,14 +297,14 @@ class TestResilientFetch:
             return _mock_urlopen_response({"ok": True})
 
         policy = RetryPolicy(max_retries=3, base_delay=0.01, jitter=False)
-        with patch("gozerai_telemetry.resilience.urlopen", side_effect=side_effect):
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=side_effect):
             result = resilient_fetch("http://test/api", retry_policy=policy)
             assert result == {"ok": True}
             assert call_count == 3
 
     def test_returns_none_after_exhausted_retries(self):
         policy = RetryPolicy(max_retries=2, base_delay=0.01, jitter=False)
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     side_effect=ConnectionError("down")):
             result = resilient_fetch("http://test/api", retry_policy=policy)
             assert result is None
@@ -251,7 +318,7 @@ class TestResilientFetch:
 
     def test_circuit_breaker_records_success(self):
         cb = CircuitBreaker(name="test")
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     return_value=_mock_urlopen_response({"ok": True})):
             resilient_fetch("http://test/api", circuit_breaker=cb)
             assert cb._success_count == 1
@@ -259,13 +326,13 @@ class TestResilientFetch:
     def test_circuit_breaker_records_failure(self):
         cb = CircuitBreaker(name="test")
         policy = RetryPolicy(max_retries=0)
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     side_effect=ConnectionError("down")):
             resilient_fetch("http://test/api", circuit_breaker=cb, retry_policy=policy)
             assert cb._total_failures == 1
 
     def test_custom_headers(self):
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     return_value=_mock_urlopen_response({"ok": True})) as mock_open:
             resilient_fetch(
                 "http://test/api",
@@ -283,23 +350,78 @@ class TestResilientFetch:
             raise ValueError("bad")
 
         policy = RetryPolicy(max_retries=3, base_delay=0.01)
-        with patch("gozerai_telemetry.resilience.urlopen", side_effect=side_effect):
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=side_effect):
             result = resilient_fetch("http://test/api", retry_policy=policy)
             assert result is None
             assert call_count == 1  # No retries for ValueError
 
     def test_default_accept_header(self):
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     return_value=_mock_urlopen_response({"ok": True})) as mock_open:
             resilient_fetch("http://test/api")
             req = mock_open.call_args[0][0]
             assert req.get_header("Accept") == "application/json"
 
     def test_timeout_passed_to_urlopen(self):
-        with patch("gozerai_telemetry.resilience.urlopen",
+        with patch("gozerai_telemetry.resilience._base.urlopen",
                     return_value=_mock_urlopen_response({"ok": True})) as mock_open:
             resilient_fetch("http://test/api", timeout=15.0)
             assert mock_open.call_args[1]["timeout"] == 15.0
+
+    def test_retries_on_429_status(self):
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _mock_urlopen_response({"error": "rate limited"}, status=429)
+            return _mock_urlopen_response({"ok": True}, status=200)
+
+        policy = RetryPolicy(max_retries=2, base_delay=0.01, jitter=False)
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=side_effect):
+            result = resilient_fetch("http://test/api", retry_policy=policy)
+            assert result == {"ok": True}
+            assert call_count == 2
+
+    def test_4xx_non_retryable_returns_none(self):
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _mock_urlopen_response({"error": "bad request"}, status=400)
+
+        policy = RetryPolicy(max_retries=3, base_delay=0.01, jitter=False)
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=side_effect):
+            result = resilient_fetch("http://test/api", retry_policy=policy)
+            assert result is None
+            assert call_count == 1  # No retry for 400
+
+    def test_500_non_retryable(self):
+        call_count = 0
+
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _mock_urlopen_response({"error": "server error"}, status=500)
+
+        policy = RetryPolicy(max_retries=3, base_delay=0.01, jitter=False)
+        with patch("gozerai_telemetry.resilience._base.urlopen", side_effect=side_effect):
+            result = resilient_fetch("http://test/api", retry_policy=policy)
+            assert result is None
+            assert call_count == 1  # 500 is not in default retryable set
+
+    def test_circuit_breaker_failure_on_exhausted_retries(self):
+        cb = CircuitBreaker(failure_threshold=10, name="exhaust-test")
+        policy = RetryPolicy(max_retries=2, base_delay=0.01, jitter=False)
+        with patch("gozerai_telemetry.resilience._base.urlopen",
+                    side_effect=ConnectionError("down")):
+            result = resilient_fetch("http://test/api",
+                                     retry_policy=policy, circuit_breaker=cb)
+            assert result is None
+            # CB should have recorded exactly one failure (after all retries exhausted)
+            assert cb._total_failures == 1
 
 
 # -- Presets ---------------------------------------------------------------
