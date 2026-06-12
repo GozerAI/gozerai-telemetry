@@ -1,15 +1,19 @@
 """Prometheus-compatible metrics collection.
 
-Compatible with C-Suite's observability/metrics.py format.
+Prometheus-compatible text exposition format.
 Zero dependencies — pure Python with thread-safe operations.
 """
 
 from __future__ import annotations
 
+import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def _labels_key(**kwargs: str) -> Tuple[Tuple[str, str], ...]:
@@ -26,16 +30,30 @@ def _labels_prometheus(labels: Tuple[Tuple[str, str], ...]) -> str:
 class Counter:
     """Monotonically increasing counter."""
 
-    def __init__(self, name: str, description: str = "") -> None:
+    DEFAULT_MAX_CARDINALITY = 1000
+
+    def __init__(self, name: str, description: str = "", max_cardinality: int = 1000) -> None:
         self.name = name
         self.description = description
+        self.max_cardinality = max_cardinality
         self._values: Dict[Tuple[Tuple[str, str], ...], float] = {}
         self._lock = Lock()
 
     def inc(self, amount: float = 1.0, **labels: str) -> None:
         key = _labels_key(**labels)
         with self._lock:
+            if key not in self._values and len(self._values) >= self.max_cardinality:
+                logger.warning(
+                    "Counter %s: cardinality limit %d reached, dropping data point with labels %s",
+                    self.name, self.max_cardinality, dict(key),
+                )
+                return
             self._values[key] = self._values.get(key, 0.0) + amount
+
+    def reset(self) -> None:
+        """Reset all metric values."""
+        with self._lock:
+            self._values.clear()
 
     def get(self, **labels: str) -> float:
         return self._values.get(_labels_key(**labels), 0.0)
@@ -53,23 +71,44 @@ class Counter:
 class Gauge:
     """Value that can go up and down."""
 
-    def __init__(self, name: str, description: str = "") -> None:
+    DEFAULT_MAX_CARDINALITY = 1000
+
+    def __init__(self, name: str, description: str = "", max_cardinality: int = 1000) -> None:
         self.name = name
         self.description = description
+        self.max_cardinality = max_cardinality
         self._values: Dict[Tuple[Tuple[str, str], ...], float] = {}
         self._lock = Lock()
 
     def set(self, value: float, **labels: str) -> None:
+        key = _labels_key(**labels)
         with self._lock:
-            self._values[_labels_key(**labels)] = value
+            if key not in self._values and len(self._values) >= self.max_cardinality:
+                logger.warning(
+                    "Gauge %s: cardinality limit %d reached, dropping data point with labels %s",
+                    self.name, self.max_cardinality, dict(key),
+                )
+                return
+            self._values[key] = value
 
     def inc(self, amount: float = 1.0, **labels: str) -> None:
         key = _labels_key(**labels)
         with self._lock:
+            if key not in self._values and len(self._values) >= self.max_cardinality:
+                logger.warning(
+                    "Gauge %s: cardinality limit %d reached, dropping data point with labels %s",
+                    self.name, self.max_cardinality, dict(key),
+                )
+                return
             self._values[key] = self._values.get(key, 0.0) + amount
 
     def dec(self, amount: float = 1.0, **labels: str) -> None:
         self.inc(-amount, **labels)
+
+    def reset(self) -> None:
+        """Reset all metric values."""
+        with self._lock:
+            self._values.clear()
 
     def get(self, **labels: str) -> float:
         return self._values.get(_labels_key(**labels), 0.0)
@@ -85,36 +124,94 @@ class Gauge:
 
 
 class Histogram:
-    """Tracks value distribution in configurable buckets."""
+    """Tracks value distribution in configurable buckets.
+
+    Also stores raw observations in a bounded FIFO deque for percentile queries.
+    """
 
     DEFAULT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+    DEFAULT_MAX_CARDINALITY = 1000
 
     def __init__(
         self,
         name: str,
         description: str = "",
         buckets: Optional[Tuple[float, ...]] = None,
+        max_observations: int = 10_000,
+        max_cardinality: int = 1000,
     ) -> None:
         self.name = name
         self.description = description
+        self.max_cardinality = max_cardinality
         self._buckets = buckets or self.DEFAULT_BUCKETS
         self._counts: Dict[Tuple[Tuple[str, str], ...], List[int]] = {}
         self._sums: Dict[Tuple[Tuple[str, str], ...], float] = {}
         self._totals: Dict[Tuple[Tuple[str, str], ...], int] = {}
+        self._observations: Dict[Tuple[Tuple[str, str], ...], deque] = {}
+        self._max_observations = max_observations
         self._lock = Lock()
 
     def observe(self, value: float, **labels: str) -> None:
         key = _labels_key(**labels)
         with self._lock:
             if key not in self._counts:
+                if len(self._counts) >= self.max_cardinality:
+                    logger.warning(
+                        "Histogram %s: cardinality limit %d reached, dropping data point with labels %s",
+                        self.name, self.max_cardinality, dict(key),
+                    )
+                    return
                 self._counts[key] = [0] * len(self._buckets)
                 self._sums[key] = 0.0
                 self._totals[key] = 0
+                self._observations[key] = deque(maxlen=self._max_observations)
             for i, bound in enumerate(self._buckets):
                 if value <= bound:
                     self._counts[key][i] += 1
             self._sums[key] += value
             self._totals[key] += 1
+            self._observations[key].append(value)
+
+    def reset(self) -> None:
+        """Reset all metric values."""
+        with self._lock:
+            self._counts.clear()
+            self._sums.clear()
+            self._totals.clear()
+            self._observations.clear()
+
+    def get_percentile(self, p: float, **labels: str) -> float:
+        """Return the p-th percentile (0-100) using linear interpolation.
+
+        Raises ValueError if p is out of range or no observations exist.
+        """
+        if not (0 <= p <= 100):
+            raise ValueError(f"Percentile must be between 0 and 100, got {p}")
+        key = _labels_key(**labels)
+        with self._lock:
+            obs = self._observations.get(key)
+            if not obs:
+                raise ValueError("No observations recorded")
+            sorted_obs = sorted(obs)
+        n = len(sorted_obs)
+        if n == 1:
+            return sorted_obs[0]
+        # Linear interpolation
+        rank = (p / 100.0) * (n - 1)
+        lower = int(rank)
+        upper = lower + 1
+        if upper >= n:
+            return sorted_obs[-1]
+        fraction = rank - lower
+        return sorted_obs[lower] + fraction * (sorted_obs[upper] - sorted_obs[lower])
+
+    def get_percentiles(self, **labels: str) -> Dict[str, float]:
+        """Return standard percentiles: p50, p95, p99."""
+        return {
+            "p50": self.get_percentile(50, **labels),
+            "p95": self.get_percentile(95, **labels),
+            "p99": self.get_percentile(99, **labels),
+        }
 
     def time(self, **labels: str):
         """Context manager to time a block and observe the duration."""
@@ -200,6 +297,15 @@ class MetricsCollector:
         sections.append(f"{self.service_name}_uptime_seconds {uptime:.1f}")
         return "\n".join(sections)
 
+    def reset(self) -> None:
+        """Reset all metric values in this collector (keeps metric registrations)."""
+        for c in self._counters.values():
+            c.reset()
+        for g in self._gauges.values():
+            g.reset()
+        for h in self._histograms.values():
+            h.reset()
+
     def to_dict(self) -> Dict[str, any]:
         """Export as JSON-friendly dict."""
         result: Dict[str, any] = {"service": self.service_name, "uptime": time.time() - self._created_at}
@@ -221,3 +327,8 @@ def get_collector(service_name: str) -> MetricsCollector:
     if service_name not in _collectors:
         _collectors[service_name] = MetricsCollector(service_name=service_name)
     return _collectors[service_name]
+
+
+def reset_collectors() -> None:
+    """Clear the global collectors registry. Useful for test isolation."""
+    _collectors.clear()

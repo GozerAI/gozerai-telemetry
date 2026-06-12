@@ -5,6 +5,7 @@ Zero dependencies. Thread-safe. Compatible with the existing resilience module.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections import deque
@@ -198,3 +199,79 @@ class FallbackChain:
             return self.execute()
         except Exception:
             return None
+
+
+class AsyncRateLimiter:
+    """Async token-bucket rate limiter.
+
+    Uses ``asyncio.Lock`` instead of ``threading.Lock`` so it can be used
+    safely inside coroutines without blocking the event loop.
+
+    Usage::
+
+        limiter = AsyncRateLimiter("api", max_requests=100, window_seconds=60.0)
+        if await limiter.allow():
+            await make_request()
+
+        # Or block until a token is available:
+        await limiter.wait(timeout=5.0)
+    """
+
+    def __init__(self, name: str, max_requests: int, window_seconds: float = 60.0) -> None:
+        self.name = name
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    def _prune(self, now: float) -> None:
+        """Remove timestamps outside the current window (caller holds lock)."""
+        cutoff = now - self.window_seconds
+        while self._timestamps and self._timestamps[0] <= cutoff:
+            self._timestamps.popleft()
+
+    async def allow(self) -> bool:
+        """Return True if a request is allowed under the rate limit."""
+        now = time.monotonic()
+        async with self._lock:
+            self._prune(now)
+            if len(self._timestamps) < self.max_requests:
+                self._timestamps.append(now)
+                return True
+            return False
+
+    async def wait(self, timeout: Optional[float] = None) -> None:
+        """Wait until a token is available.
+
+        Args:
+            timeout: Maximum seconds to wait.  ``None`` means wait forever.
+
+        Raises:
+            TimeoutError: If *timeout* elapses before a token becomes available.
+        """
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        poll_interval = 0.01  # 10 ms
+
+        while True:
+            if await self.allow():
+                return
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"AsyncRateLimiter '{self.name}' timed out after {timeout}s"
+                    )
+                await asyncio.sleep(min(poll_interval, remaining))
+            else:
+                await asyncio.sleep(poll_interval)
+
+    async def get_stats(self) -> dict:
+        now = time.monotonic()
+        async with self._lock:
+            self._prune(now)
+            return {
+                "name": self.name,
+                "max_requests": self.max_requests,
+                "window_seconds": self.window_seconds,
+                "current_count": len(self._timestamps),
+            }

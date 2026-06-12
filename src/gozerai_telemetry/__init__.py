@@ -1,6 +1,6 @@
 """GozerAI Telemetry — lightweight observability for standalone products.
 
-Zero dependencies. Compatible with C-Suite's observability module.
+Zero dependencies.
 Import and use in any GozerAI product to emit metrics, traces, and health status.
 
 Usage:
@@ -41,6 +41,7 @@ from gozerai_telemetry.metrics import (
     Histogram,
     MetricsCollector,
     get_collector,
+    reset_collectors,
 )
 from gozerai_telemetry.tracing import Span, Tracer, span
 from gozerai_telemetry.health import HealthCheck, HealthReporter, HealthStatus
@@ -57,10 +58,11 @@ from gozerai_telemetry.resilience import (
     AGGRESSIVE_RETRY,
 )
 from gozerai_telemetry.patterns import (
+    AsyncRateLimiter,
     Bulkhead,
+    FallbackChain,
     RateLimiter,
     Timeout,
-    FallbackChain,
 )
 from gozerai_telemetry.log_format import StructuredFormatter, setup_logging, get_logger
 from gozerai_telemetry.correlation import (
@@ -77,6 +79,7 @@ __all__ = [
     "Histogram",
     "MetricsCollector",
     "get_collector",
+    "reset_collectors",
     "Span",
     "Tracer",
     "span",
@@ -93,10 +96,11 @@ __all__ = [
     "DEFAULT_RETRY",
     "CONSERVATIVE_RETRY",
     "AGGRESSIVE_RETRY",
+    "AsyncRateLimiter",
     "Bulkhead",
+    "FallbackChain",
     "RateLimiter",
     "Timeout",
-    "FallbackChain",
     "StructuredFormatter",
     "setup_logging",
     "get_logger",

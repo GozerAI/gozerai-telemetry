@@ -1,8 +1,17 @@
 """Tests for metrics collection."""
 
+import logging
 import threading
 
-from gozerai_telemetry.metrics import Counter, Gauge, Histogram, MetricsCollector, get_collector, _collectors
+from gozerai_telemetry.metrics import (
+    Counter,
+    Gauge,
+    Histogram,
+    MetricsCollector,
+    get_collector,
+    reset_collectors,
+    _collectors,
+)
 
 
 class TestCounter:
@@ -321,3 +330,296 @@ class TestGetCollector:
         c1 = get_collector("svc_x")
         c2 = get_collector("svc_y")
         assert c1 is not c2
+
+
+# ── Gap 1: reset_collectors() and .reset() for test isolation ──
+
+
+class TestResetCollectors:
+    def setup_method(self):
+        _collectors.clear()
+
+    def test_reset_collectors_clears_registry(self):
+        get_collector("a")
+        get_collector("b")
+        assert len(_collectors) == 2
+        reset_collectors()
+        assert len(_collectors) == 0
+
+    def test_reset_collectors_new_instance_after_reset(self):
+        c1 = get_collector("svc")
+        reset_collectors()
+        c2 = get_collector("svc")
+        assert c1 is not c2
+
+    def test_reset_collectors_importable_from_package(self):
+        from gozerai_telemetry import reset_collectors as rc
+        assert callable(rc)
+
+
+class TestCounterReset:
+    def test_reset_clears_all_values(self):
+        c = Counter("reset_test")
+        c.inc(5, method="GET")
+        c.inc(3, method="POST")
+        c.reset()
+        assert c.get(method="GET") == 0.0
+        assert c.get(method="POST") == 0.0
+        assert len(c._values) == 0
+
+    def test_reset_allows_reuse(self):
+        c = Counter("reuse_test")
+        c.inc(10)
+        c.reset()
+        c.inc(1)
+        assert c.get() == 1.0
+
+    def test_reset_empty_counter(self):
+        c = Counter("empty_reset")
+        c.reset()
+        assert c.get() == 0.0
+
+
+class TestGaugeReset:
+    def test_reset_clears_all_values(self):
+        g = Gauge("reset_gauge")
+        g.set(42, env="prod")
+        g.set(10, env="dev")
+        g.reset()
+        assert g.get(env="prod") == 0.0
+        assert g.get(env="dev") == 0.0
+        assert len(g._values) == 0
+
+    def test_reset_allows_reuse(self):
+        g = Gauge("reuse_gauge")
+        g.set(100)
+        g.reset()
+        g.set(5)
+        assert g.get() == 5.0
+
+    def test_reset_empty_gauge(self):
+        g = Gauge("empty_gauge_reset")
+        g.reset()
+        assert g.get() == 0.0
+
+
+class TestHistogramReset:
+    def test_reset_clears_all_values(self):
+        h = Histogram("reset_hist", buckets=(0.1, 1.0))
+        h.observe(0.05)
+        h.observe(0.5, endpoint="/api")
+        h.reset()
+        assert len(h._counts) == 0
+        assert len(h._sums) == 0
+        assert len(h._totals) == 0
+        assert len(h._observations) == 0
+
+    def test_reset_allows_reuse(self):
+        h = Histogram("reuse_hist", buckets=(1.0,))
+        h.observe(0.5)
+        h.reset()
+        h.observe(0.8)
+        assert h._totals[()] == 1
+        assert h._sums[()] == 0.8
+
+    def test_reset_empty_histogram(self):
+        h = Histogram("empty_hist_reset", buckets=(1.0,))
+        h.reset()
+        assert len(h._counts) == 0
+
+
+class TestMetricsCollectorReset:
+    def test_reset_clears_all_metric_values(self):
+        mc = MetricsCollector(service_name="reset_svc")
+        mc.counter("hits").inc(10, method="GET")
+        mc.gauge("active").set(5)
+        mc.histogram("latency", buckets=(1.0,)).observe(0.5)
+        mc.reset()
+        assert mc.counter("hits").get(method="GET") == 0.0
+        assert mc.gauge("active").get() == 0.0
+        assert len(mc.histogram("latency")._totals) == 0
+
+    def test_reset_preserves_metric_registrations(self):
+        mc = MetricsCollector(service_name="preserve_svc")
+        c = mc.counter("hits")
+        g = mc.gauge("active")
+        h = mc.histogram("latency")
+        mc.reset()
+        # Same instances should still be returned
+        assert mc.counter("hits") is c
+        assert mc.gauge("active") is g
+        assert mc.histogram("latency") is h
+
+    def test_reset_then_increment(self):
+        mc = MetricsCollector(service_name="incr_svc")
+        mc.counter("total").inc(100)
+        mc.reset()
+        mc.counter("total").inc(1)
+        assert mc.counter("total").get() == 1.0
+
+
+# ── Gap 2: Cardinality limits ──
+
+
+class TestCounterCardinality:
+    def test_default_max_cardinality(self):
+        assert Counter.DEFAULT_MAX_CARDINALITY == 1000
+        c = Counter("card_test")
+        assert c.max_cardinality == 1000
+
+    def test_custom_max_cardinality(self):
+        c = Counter("card_custom", max_cardinality=5)
+        assert c.max_cardinality == 5
+
+    def test_cardinality_limit_drops_new_label_sets(self):
+        c = Counter("card_limit", max_cardinality=3)
+        c.inc(user="a")
+        c.inc(user="b")
+        c.inc(user="c")
+        # At limit: new label set should be dropped
+        c.inc(user="d")
+        assert c.get(user="d") == 0.0
+        assert len(c._values) == 3
+
+    def test_cardinality_existing_labels_still_work(self):
+        c = Counter("card_existing", max_cardinality=2)
+        c.inc(user="a")
+        c.inc(user="b")
+        # Existing label set should still accept increments
+        c.inc(5, user="a")
+        assert c.get(user="a") == 6.0
+
+    def test_cardinality_limit_logs_warning(self, caplog):
+        c = Counter("card_warn", max_cardinality=1)
+        c.inc(user="a")
+        with caplog.at_level(logging.WARNING, logger="gozerai_telemetry.metrics"):
+            c.inc(user="b")
+        assert "cardinality limit" in caplog.text
+        assert "card_warn" in caplog.text
+
+    def test_cardinality_zero_blocks_all(self):
+        c = Counter("card_zero", max_cardinality=0)
+        c.inc(user="a")
+        assert c.get(user="a") == 0.0
+        assert len(c._values) == 0
+
+    def test_cardinality_no_labels_counts_as_one(self):
+        c = Counter("card_nolabel", max_cardinality=1)
+        c.inc()  # () key
+        c.inc(user="a")  # Should be dropped
+        assert c.get() == 1.0
+        assert c.get(user="a") == 0.0
+
+
+class TestGaugeCardinality:
+    def test_default_max_cardinality(self):
+        assert Gauge.DEFAULT_MAX_CARDINALITY == 1000
+        g = Gauge("gcard_test")
+        assert g.max_cardinality == 1000
+
+    def test_custom_max_cardinality(self):
+        g = Gauge("gcard_custom", max_cardinality=5)
+        assert g.max_cardinality == 5
+
+    def test_set_cardinality_limit(self):
+        g = Gauge("gcard_set", max_cardinality=2)
+        g.set(1.0, env="prod")
+        g.set(2.0, env="dev")
+        g.set(3.0, env="staging")  # Should be dropped
+        assert g.get(env="staging") == 0.0
+        assert len(g._values) == 2
+
+    def test_inc_cardinality_limit(self):
+        g = Gauge("gcard_inc", max_cardinality=2)
+        g.inc(1.0, env="prod")
+        g.inc(1.0, env="dev")
+        g.inc(1.0, env="staging")  # Should be dropped
+        assert g.get(env="staging") == 0.0
+
+    def test_dec_cardinality_limit(self):
+        g = Gauge("gcard_dec", max_cardinality=1)
+        g.set(10, env="prod")
+        g.dec(1, env="new")  # Should be dropped (dec calls inc)
+        assert g.get(env="new") == 0.0
+
+    def test_existing_labels_still_work(self):
+        g = Gauge("gcard_exist", max_cardinality=1)
+        g.set(10, env="prod")
+        g.set(20, env="prod")  # Same label, should work
+        assert g.get(env="prod") == 20
+
+    def test_set_cardinality_logs_warning(self, caplog):
+        g = Gauge("gcard_warn", max_cardinality=1)
+        g.set(1.0, env="prod")
+        with caplog.at_level(logging.WARNING, logger="gozerai_telemetry.metrics"):
+            g.set(2.0, env="dev")
+        assert "cardinality limit" in caplog.text
+        assert "gcard_warn" in caplog.text
+
+
+class TestHistogramCardinality:
+    def test_default_max_cardinality(self):
+        assert Histogram.DEFAULT_MAX_CARDINALITY == 1000
+        h = Histogram("hcard_test")
+        assert h.max_cardinality == 1000
+
+    def test_custom_max_cardinality(self):
+        h = Histogram("hcard_custom", max_cardinality=5)
+        assert h.max_cardinality == 5
+
+    def test_observe_cardinality_limit(self):
+        h = Histogram("hcard_obs", buckets=(1.0,), max_cardinality=2)
+        h.observe(0.5, endpoint="/a")
+        h.observe(0.5, endpoint="/b")
+        h.observe(0.5, endpoint="/c")  # Should be dropped
+        assert len(h._counts) == 2
+        assert () not in h._totals or h._totals.get((("endpoint", "/c"),)) is None
+
+    def test_existing_labels_still_work(self):
+        h = Histogram("hcard_exist", buckets=(1.0,), max_cardinality=1)
+        h.observe(0.5, endpoint="/a")
+        h.observe(0.8, endpoint="/a")  # Same label, should work
+        key = (("endpoint", "/a"),)
+        assert h._totals[key] == 2
+
+    def test_observe_cardinality_logs_warning(self, caplog):
+        h = Histogram("hcard_warn", buckets=(1.0,), max_cardinality=1)
+        h.observe(0.5, endpoint="/a")
+        with caplog.at_level(logging.WARNING, logger="gozerai_telemetry.metrics"):
+            h.observe(0.5, endpoint="/b")
+        assert "cardinality limit" in caplog.text
+        assert "hcard_warn" in caplog.text
+
+    def test_cardinality_after_reset(self):
+        h = Histogram("hcard_reset", buckets=(1.0,), max_cardinality=2)
+        h.observe(0.5, endpoint="/a")
+        h.observe(0.5, endpoint="/b")
+        h.observe(0.5, endpoint="/c")  # Dropped
+        assert len(h._counts) == 2
+        h.reset()
+        # After reset, should accept new labels again
+        h.observe(0.5, endpoint="/c")
+        h.observe(0.5, endpoint="/d")
+        assert len(h._counts) == 2
+
+    def test_counter_cardinality_after_reset(self):
+        c = Counter("ccard_reset", max_cardinality=2)
+        c.inc(user="a")
+        c.inc(user="b")
+        c.inc(user="c")  # Dropped
+        assert len(c._values) == 2
+        c.reset()
+        c.inc(user="c")
+        c.inc(user="d")
+        assert len(c._values) == 2
+        assert c.get(user="c") == 1.0
+
+    def test_gauge_cardinality_after_reset(self):
+        g = Gauge("gcard_reset", max_cardinality=2)
+        g.set(1, env="a")
+        g.set(1, env="b")
+        g.set(1, env="c")  # Dropped
+        assert len(g._values) == 2
+        g.reset()
+        g.set(1, env="c")
+        assert g.get(env="c") == 1.0

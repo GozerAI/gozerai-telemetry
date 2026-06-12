@@ -1,4 +1,4 @@
-"""Distributed tracing compatible with C-Suite's observability/tracing.py.
+"""Distributed tracing for GozerAI products.
 
 Provides lightweight span tracking with context propagation.
 Zero dependencies — uses contextvars for async-safe context.
@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 # Active span context propagation
 _current_span: ContextVar[Optional["Span"]] = ContextVar("_current_span", default=None)
@@ -87,6 +87,34 @@ class Tracer:
     @contextmanager
     def span(self, name: str, **attributes: Any) -> Iterator[Span]:
         """Context manager that creates a span, sets it as current, and records it."""
+        parent = _current_span.get()
+        trace_id = parent.trace_id if parent else uuid.uuid4().hex
+        span_id = uuid.uuid4().hex[:16]
+        parent_span_id = parent.span_id if parent else None
+
+        s = Span(
+            name=name,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            service_name=self.service_name,
+            attributes=dict(attributes),
+        )
+
+        token = _current_span.set(s)
+        try:
+            yield s
+        except Exception as e:
+            s.set_error(e)
+            raise
+        finally:
+            s.end()
+            _current_span.reset(token)
+            self._record(s)
+
+    @asynccontextmanager
+    async def async_span(self, name: str, **attributes: Any) -> AsyncIterator[Span]:
+        """Async context manager that creates a span, sets it as current, and records it."""
         parent = _current_span.get()
         trace_id = parent.trace_id if parent else uuid.uuid4().hex
         span_id = uuid.uuid4().hex[:16]

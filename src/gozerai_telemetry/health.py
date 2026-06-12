@@ -7,9 +7,10 @@ aggregated by a central collector or Kubernetes probes.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class HealthStatus(Enum):
@@ -44,12 +45,26 @@ class HealthReporter:
     def __init__(self, service_name: str, version: str = "0.0.0") -> None:
         self.service_name = service_name
         self.version = version
-        self._checks: Dict[str, Callable[[], bool]] = {}
+        self._checks: Dict[str, Tuple[Callable[[], bool], float, bool]] = {}
         self._started_at = time.time()
 
-    def register_check(self, name: str, check_fn: Callable[[], bool]) -> None:
-        """Register a health check function. Should return True if healthy."""
-        self._checks[name] = check_fn
+    def register_check(
+        self,
+        name: str,
+        check_fn: Callable[[], bool],
+        timeout: float = 5.0,
+        critical: bool = True,
+    ) -> None:
+        """Register a health check function.
+
+        Args:
+            name: Unique name for the check.
+            check_fn: Callable returning True if healthy.
+            timeout: Maximum seconds to wait before marking as timed out.
+            critical: If True, failure sets overall status to UNHEALTHY.
+                      If False, failure sets overall status to DEGRADED.
+        """
+        self._checks[name] = (check_fn, timeout, critical)
 
     def unregister_check(self, name: str) -> None:
         self._checks.pop(name, None)
@@ -59,18 +74,34 @@ class HealthReporter:
         results: List[HealthCheck] = []
         overall = HealthStatus.HEALTHY
 
-        for name, check_fn in self._checks.items():
+        for name, (check_fn, timeout, critical) in self._checks.items():
             start = time.monotonic()
+            fail_status = HealthStatus.UNHEALTHY if critical else HealthStatus.DEGRADED
             try:
-                ok = check_fn()
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(check_fn)
+                try:
+                    ok = future.result(timeout=timeout)
+                except FuturesTimeoutError:
+                    duration = (time.monotonic() - start) * 1000
+                    results.append(HealthCheck(
+                        name=name,
+                        status=fail_status,
+                        message="Health check timed out",
+                        duration_ms=duration,
+                    ))
+                    # Shut down without waiting for the hung thread
+                    executor.shutdown(wait=False)
+                    continue
+                executor.shutdown(wait=False)
                 duration = (time.monotonic() - start) * 1000
-                status = HealthStatus.HEALTHY if ok else HealthStatus.UNHEALTHY
+                status = HealthStatus.HEALTHY if ok else fail_status
                 results.append(HealthCheck(name=name, status=status, duration_ms=duration))
             except Exception as e:
                 duration = (time.monotonic() - start) * 1000
                 results.append(HealthCheck(
                     name=name,
-                    status=HealthStatus.UNHEALTHY,
+                    status=fail_status,
                     message=str(e),
                     duration_ms=duration,
                 ))
