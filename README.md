@@ -1,5 +1,8 @@
 # Gozerai Telemetry
 
+[![GozerAI](https://img.shields.io/badge/GozerAI-ecosystem-5eead4?style=flat-square&labelColor=0b0e14)](https://github.com/GozerAI) [![License](https://img.shields.io/badge/license-MIT-3b82f6?style=flat-square)](LICENSE) [![Python](https://img.shields.io/badge/python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org) [![dependencies](https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square)]()
+
+
 **Lightweight, zero-dependency observability for Python services** — part of the [GozerAI](https://gozerai.com) ecosystem.
 
 A single small package that emits Prometheus-compatible metrics, distributed traces, health status, structured logs, and SLO tracking — with no third-party dependencies. Drop it into any service to get consistent telemetry across a fleet.
